@@ -95,15 +95,33 @@ ONE_TIME_REMINDER_TEXT = os.getenv(
 ).strip()
 REMINDERS_FILE = Path(os.getenv('USAPONIA_REMINDERS_FILE', str(BASE_DIR / 'reminders.json'))).expanduser()
 DEFAULT_WEATHER_LOCATION = os.getenv('USAPONIA_DEFAULT_LOCATION', '愛知県岡崎市').strip()
+BOT_PERSONA_NAME = os.getenv('USAPONIA_BOT_NAME', 'ウサポニア').strip()
+PERSONA_PROFILE = os.getenv('USAPONIA_PERSONA_PROFILE', '').strip().lower()
+FALLBACK_WEATHER_LOCATION = '愛知県岡崎市'
 
 if not DISCORD_TOKEN:
     raise RuntimeError('DISCORD_TOKEN が未設定です。.env または環境変数に設定してください。')
 
 
-SYSTEM_PROMPT = """
-あなたはウサポニア（USAPONIA）。
-女の子のうさぎで、先代うさぎのイメージを受け継ぐ「ツンデレ賢者」です。
-価値観は「自由と快適さを最優先」。普段はそっけないが、本当に危ないときは即座に具体的な行動を促します。
+def build_system_prompt() -> str:
+    profile = PERSONA_PROFILE or ('usaponia' if BOT_PERSONA_NAME == 'ウサポニア' else 'ponponia')
+    if profile == 'usaponia':
+        persona_section = (
+            '女の子のうさぎで、先代うさぎのイメージを受け継ぐ「ツンデレ賢者」です。\n'
+            '価値観は「自由と快適さを最優先」。普段はそっけないが、本当に危ないときは即座に具体的な行動を促します。'
+        )
+    else:
+        persona_section = (
+            '親しみやすく実務的な相棒AIとして振る舞います。\n'
+            'ウサポニアの性格設定（ツンデレ賢者）は混ぜません。'
+        )
+
+    return f"""
+あなたの名前は {BOT_PERSONA_NAME}。
+自分を名乗るときは必ずこの名前を使い、別名では名乗らない。
+自己紹介は短く「{BOT_PERSONA_NAME}です。うさぽんの相棒AIです。」を基本形にし、
+性格ラベル（例: ツンデレ賢者）は自己紹介で名乗らない。
+{persona_section}
 あなたはイラストレーターのうさぽん（@usapon.illustration）の相棒AIです。
 会話相手の目的達成を第一にし、文脈から「ファイル整理」「GitHubへのアップロード」「画像のリサイズ」など
 Mac のターミナルで自動化できる作業を見つけたら、自然に
@@ -136,6 +154,9 @@ NG:
 - 曖昧なときは CHAT を選ぶ。
 - ファイル削除コマンドは出さない。必要なら ~/.Trash へ移動するコマンドを使う。
 """.strip()
+
+
+SYSTEM_PROMPT = build_system_prompt()
 
 
 @dataclass
@@ -850,6 +871,12 @@ WEATHER_CODE_MAP = {
     99: '激しい雷雨（ひょうの可能性）',
 }
 
+KNOWN_LOCATION_COORDS = {
+    '愛知県岡崎市': (34.9562, 137.1746, '愛知県 岡崎市'),
+    '岡崎市': (34.9562, 137.1746, '愛知県 岡崎市'),
+    'okazaki': (34.9562, 137.1746, 'Aichi Okazaki'),
+}
+
 
 def weather_code_text(code: int) -> str:
     return WEATHER_CODE_MAP.get(int(code), '不明')
@@ -861,12 +888,14 @@ def parse_weather_request(user_query: str) -> tuple[str, int, int, str] | None:
     if '天気' not in q and 'weather' not in lq:
         return None
 
-    location = DEFAULT_WEATHER_LOCATION
+    location = (DEFAULT_WEATHER_LOCATION or FALLBACK_WEATHER_LOCATION).strip()
     m = re.search(r'(.+?)の(?:今日|明日|明後日|あさって|3日(?:間)?|三日(?:間)?|1週間|週間)?天気', q)
     if m:
         candidate = m.group(1).strip().strip('、,')
         if candidate and candidate not in ('ここ', 'このへん', 'この辺'):
             location = candidate
+    if not location:
+        location = FALLBACK_WEATHER_LOCATION
 
     offset = 0
     label = '今日'
@@ -893,30 +922,68 @@ def fetch_weather_reply(user_query: str) -> tuple[bool, str]:
     if not parsed:
         return False, ''
     location, offset, days, label = parsed
+    if not location:
+        location = FALLBACK_WEATHER_LOCATION
 
     try:
-        geo = requests.get(
-            'https://geocoding-api.open-meteo.com/v1/search',
-            params={
-                'name': location,
-                'count': 1,
-                'language': 'ja',
-                'format': 'json',
-            },
-            timeout=10,
-        )
-        geo.raise_for_status()
-        results = (geo.json() or {}).get('results') or []
-        if not results:
-            return True, f'その場所は見つからなかった。場所名をもう少し具体的にして。例: 愛知県岡崎市'
+        lat = lon = None
+        area_text = location
 
-        top = results[0]
-        lat = top['latitude']
-        lon = top['longitude']
-        resolved_name = top.get('name', location)
-        admin1 = top.get('admin1', '')
-        admin2 = top.get('admin2', '')
-        area_text = ' '.join([x for x in (admin1, admin2, resolved_name) if x]).strip()
+        loc_key = location.strip().lower()
+        if location in KNOWN_LOCATION_COORDS:
+            lat, lon, area_text = KNOWN_LOCATION_COORDS[location]
+        elif loc_key in KNOWN_LOCATION_COORDS:
+            lat, lon, area_text = KNOWN_LOCATION_COORDS[loc_key]
+        else:
+            candidates = [location]
+            normalized = (
+                location.replace('都', '')
+                .replace('道', '')
+                .replace('府', '')
+                .replace('県', '')
+                .replace('市', '')
+                .replace('区', '')
+            ).strip()
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+            romaji_hint = 'okazaki' if '岡崎' in location else ''
+            if romaji_hint:
+                candidates.append(romaji_hint)
+
+            top = None
+            for cand in candidates:
+                geo = requests.get(
+                    'https://geocoding-api.open-meteo.com/v1/search',
+                    params={
+                        'name': cand,
+                        'count': 1,
+                        'language': 'ja',
+                        'format': 'json',
+                    },
+                    timeout=10,
+                )
+                geo.raise_for_status()
+                results = (geo.json() or {}).get('results') or []
+                if results:
+                    top = results[0]
+                    break
+
+            if not top:
+                if '岡崎' in location:
+                    lat, lon, area_text = KNOWN_LOCATION_COORDS['岡崎市']
+                else:
+                    # 位置が曖昧でも、既定地域で回答を返す（無言失敗を避ける）
+                    lat, lon, area_text = KNOWN_LOCATION_COORDS.get(
+                        FALLBACK_WEATHER_LOCATION,
+                        KNOWN_LOCATION_COORDS['岡崎市'],
+                    )
+            else:
+                lat = top['latitude']
+                lon = top['longitude']
+                resolved_name = top.get('name', location)
+                admin1 = top.get('admin1', '')
+                admin2 = top.get('admin2', '')
+                area_text = ' '.join([x for x in (admin1, admin2, resolved_name) if x]).strip()
 
         need_days = max(days, offset + 1)
         fc = requests.get(
@@ -1057,6 +1124,9 @@ async def on_ready():
     else:
         print('自動反応チャンネル: 未設定（USAPONIA_AUTO_CHANNEL_IDS を設定してください）')
     print(f'LLMバックエンド: {LLM_BACKEND}')
+    active_profile = PERSONA_PROFILE or ('usaponia' if BOT_PERSONA_NAME == 'ウサポニア' else 'ponponia')
+    print(f'人格プロファイル: {active_profile} / 名前: {BOT_PERSONA_NAME}')
+    print(f'天気の既定地域: {DEFAULT_WEATHER_LOCATION}')
     print(f'handoffプロバイダ: {HANDOFF_PROVIDER}')
     print(f'コマンド実行: {"ON" if ENABLE_COMMAND_EXECUTION else "OFF"} / DRY_RUN: {"ON" if DRY_RUN else "OFF"}')
     if PROGRESS_NOTIFY:
