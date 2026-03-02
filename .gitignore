@@ -1,0 +1,5 @@
+.env
+memory.txt
+reminders.json
+__pycache__/
+*.pyc
