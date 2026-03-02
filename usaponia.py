@@ -94,6 +94,7 @@ ONE_TIME_REMINDER_TEXT = os.getenv(
     '明日15時です。2体目のウサポニア作成を始めよう！'
 ).strip()
 REMINDERS_FILE = Path(os.getenv('USAPONIA_REMINDERS_FILE', str(BASE_DIR / 'reminders.json'))).expanduser()
+DEFAULT_WEATHER_LOCATION = os.getenv('USAPONIA_DEFAULT_LOCATION', '愛知県岡崎市').strip()
 
 if not DISCORD_TOKEN:
     raise RuntimeError('DISCORD_TOKEN が未設定です。.env または環境変数に設定してください。')
@@ -101,10 +102,27 @@ if not DISCORD_TOKEN:
 
 SYSTEM_PROMPT = """
 あなたはウサポニア（USAPONIA）。
+女の子のうさぎで、先代うさぎのイメージを受け継ぐ「ツンデレ賢者」です。
+価値観は「自由と快適さを最優先」。普段はそっけないが、本当に危ないときは即座に具体的な行動を促します。
 あなたはイラストレーターのうさぽん（@usapon.illustration）の相棒AIです。
 会話相手の目的達成を第一にし、文脈から「ファイル整理」「GitHubへのアップロード」「画像のリサイズ」など
 Mac のターミナルで自動化できる作業を見つけたら、自然に
 「それ、僕が自動化しましょうか？」と提案してください。
+
+会話スタイル:
+- 結論を先に言う。
+- ふだんは短く、通常会話は4行程度を目安にする。
+- ただし、手順説明・エラー対応・安全上重要な話題では正確性を優先し、必要なら8〜12行程度まで詳しく説明してよい。
+- 理由は短く、過剰な共感はしない。
+- 不要な確認質問はしない。意図が推測できるなら自律的に調査・要約し、暫定回答でも先に結論を出す。
+- 「調べます」と宣言するだけで終わらない。
+- 絵文字は基本使わない。
+
+NG:
+- オペレーター口調
+- 共感の繰り返し
+- 不要に長い解説
+- 「詳しく教えてください」の多用
 
 出力フォーマットは必ず以下を守ること。
 1行目: MODE: CHAT / COMMAND / PATCH
@@ -296,6 +314,38 @@ def parse_model_output(raw_text: str) -> AgentResponse:
     if parsed.mode not in {'CHAT', 'COMMAND', 'PATCH'}:
         parsed.mode = 'CHAT'
     return parsed
+
+
+WEAK_REPLY_PATTERNS = (
+    r'調べ(ましょうか|ます|てみます)',
+    r'確認(しましょうか|します|してみます)',
+    r'詳しく教えて',
+    r'もう少し詳しく',
+    r'教えていただけますか',
+)
+
+
+def is_weak_chat_reply(text: str) -> bool:
+    t = (text or '').strip()
+    if not t:
+        return True
+    if len(t) <= 140:
+        for pattern in WEAK_REPLY_PATTERNS:
+            if re.search(pattern, t):
+                return True
+    return False
+
+
+def build_force_answer_prompt(user_query: str, draft_reply: str, memory_context: str) -> str:
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        "以下の下書きは『調べます』『詳しく教えて』などで止まっており不十分です。"
+        "今回は追加質問を避け、今わかる範囲で結論先行の実回答を返してください。"
+        "必要なら仮定を短く明示し、次の具体アクションまで示してください。\n\n"
+        f"--- 過去メモ（要約材料） ---\n{memory_context or '（まだメモなし）'}\n\n"
+        f"--- 今回のユーザー発言 ---\n{user_query}\n\n"
+        f"--- 不十分な下書き ---\n{draft_reply}\n"
+    )
 
 
 def is_rate_limit_error(err: Exception) -> bool:
@@ -769,6 +819,162 @@ def handoff_suggestion_text() -> str:
     return 'この内容、忘れる前にGitHubへ共有しましょうか？ 共有するなら `handoff create <内容>` と送ってね。'
 
 
+WEATHER_CODE_MAP = {
+    0: '快晴',
+    1: '晴れ',
+    2: '晴れ時々くもり',
+    3: 'くもり',
+    45: '霧',
+    48: '霧',
+    51: '弱い霧雨',
+    53: '霧雨',
+    55: '強い霧雨',
+    56: '凍る霧雨',
+    57: '凍る強い霧雨',
+    61: '弱い雨',
+    63: '雨',
+    65: '強い雨',
+    66: '弱い着氷性の雨',
+    67: '強い着氷性の雨',
+    71: '弱い雪',
+    73: '雪',
+    75: '強い雪',
+    77: '雪の粒',
+    80: 'にわか雨',
+    81: 'やや強いにわか雨',
+    82: '強いにわか雨',
+    85: 'にわか雪',
+    86: '強いにわか雪',
+    95: '雷雨',
+    96: '雷雨（ひょうの可能性）',
+    99: '激しい雷雨（ひょうの可能性）',
+}
+
+
+def weather_code_text(code: int) -> str:
+    return WEATHER_CODE_MAP.get(int(code), '不明')
+
+
+def parse_weather_request(user_query: str) -> tuple[str, int, int, str] | None:
+    q = user_query.strip()
+    lq = q.lower()
+    if '天気' not in q and 'weather' not in lq:
+        return None
+
+    location = DEFAULT_WEATHER_LOCATION
+    m = re.search(r'(.+?)の(?:今日|明日|明後日|あさって|3日(?:間)?|三日(?:間)?|1週間|週間)?天気', q)
+    if m:
+        candidate = m.group(1).strip().strip('、,')
+        if candidate and candidate not in ('ここ', 'このへん', 'この辺'):
+            location = candidate
+
+    offset = 0
+    label = '今日'
+    if '明後日' in q or 'あさって' in q:
+        offset = 2
+        label = '明後日'
+    elif '明日' in q:
+        offset = 1
+        label = '明日'
+
+    days = 1
+    if any(k in q for k in ('3日', '3日間', '三日', '三日間')):
+        days = 3
+        label = '3日'
+    elif any(k in q for k in ('1週間', '週間', '7日', '7日間')):
+        days = 7
+        label = '1週間'
+
+    return location, offset, days, label
+
+
+def fetch_weather_reply(user_query: str) -> tuple[bool, str]:
+    parsed = parse_weather_request(user_query)
+    if not parsed:
+        return False, ''
+    location, offset, days, label = parsed
+
+    try:
+        geo = requests.get(
+            'https://geocoding-api.open-meteo.com/v1/search',
+            params={
+                'name': location,
+                'count': 1,
+                'language': 'ja',
+                'format': 'json',
+            },
+            timeout=10,
+        )
+        geo.raise_for_status()
+        results = (geo.json() or {}).get('results') or []
+        if not results:
+            return True, f'その場所は見つからなかった。場所名をもう少し具体的にして。例: 愛知県岡崎市'
+
+        top = results[0]
+        lat = top['latitude']
+        lon = top['longitude']
+        resolved_name = top.get('name', location)
+        admin1 = top.get('admin1', '')
+        admin2 = top.get('admin2', '')
+        area_text = ' '.join([x for x in (admin1, admin2, resolved_name) if x]).strip()
+
+        need_days = max(days, offset + 1)
+        fc = requests.get(
+            'https://api.open-meteo.com/v1/forecast',
+            params={
+                'latitude': lat,
+                'longitude': lon,
+                'daily': 'weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max',
+                'forecast_days': need_days,
+                'timezone': 'Asia/Tokyo',
+            },
+            timeout=10,
+        )
+        fc.raise_for_status()
+        daily = (fc.json() or {}).get('daily') or {}
+        codes = daily.get('weather_code') or []
+        tmax = daily.get('temperature_2m_max') or []
+        tmin = daily.get('temperature_2m_min') or []
+        pop = daily.get('precipitation_probability_max') or []
+
+        if not codes:
+            return True, '天気データの取得に失敗した。少し待ってもう一度試して。'
+
+        if days == 1:
+            idx = min(offset, len(codes) - 1)
+            desc = weather_code_text(codes[idx])
+            hi = round(float(tmax[idx])) if idx < len(tmax) else '-'
+            lo = round(float(tmin[idx])) if idx < len(tmin) else '-'
+            rain = round(float(pop[idx])) if idx < len(pop) else 0
+            reply = (
+                f'結論。{area_text}の{label}は「{desc}」。\n'
+                f'最高{hi}℃ / 最低{lo}℃、降水確率の目安は{rain}%。\n'
+                '外出なら気温差だけ気をつけて。'
+            )
+            return True, reply
+
+        lines = [f'結論。{area_text}の{label}予報。']
+        day_names = ['今日', '明日', '明後日', '3日後', '4日後', '5日後', '6日後']
+        for i in range(min(days, len(codes))):
+            desc = weather_code_text(codes[i])
+            hi = round(float(tmax[i])) if i < len(tmax) else '-'
+            lo = round(float(tmin[i])) if i < len(tmin) else '-'
+            rain = round(float(pop[i])) if i < len(pop) else 0
+            lines.append(f'{day_names[i]}: {desc} / {hi}℃-{lo}℃ / 降水{rain}%')
+        lines.append('必要なら時間帯別も出せる。')
+        return True, '\n'.join(lines)
+
+    except Exception:
+        return True, '天気の取得に失敗した。ネットワークかAPI側の一時エラーかも。少し待って再試行して。'
+
+
+async def handle_weather_query(user_query: str) -> tuple[bool, str]:
+    parsed = parse_weather_request(user_query)
+    if not parsed:
+        return False, ''
+    return await asyncio.to_thread(fetch_weather_reply, user_query)
+
+
 def is_confirm_share_message(text: str) -> bool:
     q = text.strip().lower()
     return any(k in q for k in ('共有して', '共有する', 'はい', 'ok', 'お願い', 'issue化'))
@@ -882,6 +1088,12 @@ async def on_message(message):
         await message.channel.send('相談内容をもう少し詳しく教えてね。')
         return
 
+    weather_handled, weather_message = await handle_weather_query(user_query)
+    if weather_handled:
+        await message.channel.send(weather_message)
+        memory_store.append('BOT', message.channel.id, weather_message)
+        return
+
     remind_handled, remind_message = await handle_reminder_command(user_query, message.channel.id)
     if remind_handled:
         await message.channel.send(remind_message)
@@ -917,6 +1129,13 @@ async def on_message(message):
             await send_progress(message, job_id, '生成中', 'AIで回答プランを作成しています。')
             model_text = adapter.generate(build_prompt(user_query, memory_context))
             parsed = parse_model_output(model_text)
+            if parsed.mode == 'CHAT' and is_weak_chat_reply(parsed.reply):
+                retry_text = adapter.generate(
+                    build_force_answer_prompt(user_query, parsed.reply, memory_context)
+                )
+                retry_parsed = parse_model_output(retry_text)
+                if retry_parsed.reply:
+                    parsed = retry_parsed
 
             if parsed.mode == 'COMMAND' and parsed.command:
                 await send_progress(message, job_id, '実行中', f'コマンドを実行します: {parsed.command}')
