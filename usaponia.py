@@ -306,6 +306,22 @@ class GeminiAdapter(BaseAdapter):
         return (response.text or '').strip()
 
 
+def generate_with_retry(prompt: str, retries: int = 1, wait_sec: float = 1.5) -> str:
+    last_err = None
+    for i in range(retries + 1):
+        try:
+            return adapter.generate(prompt)
+        except genai.errors.APIError as e:
+            last_err = e
+            if i < retries and is_rate_limit_error(e):
+                time.sleep(wait_sec)
+                continue
+            raise
+    if last_err:
+        raise last_err
+    return ''
+
+
 class CodexAdapter(BaseAdapter):
     # 将来: Codex API / local Codex runtime と接続する実体に差し替える
     def generate(self, prompt: str) -> str:
@@ -407,7 +423,14 @@ def build_force_answer_prompt(user_query: str, draft_reply: str, memory_context:
 def is_rate_limit_error(err: Exception) -> bool:
     code = getattr(err, 'code', None)
     status = str(getattr(err, 'status', '')).upper()
-    return code == 429 or 'RESOURCE_EXHAUSTED' in status or 'TOO_MANY_REQUESTS' in status
+    message = str(err).upper()
+    return (
+        code in {429, 503}
+        or 'RESOURCE_EXHAUSTED' in status
+        or 'TOO_MANY_REQUESTS' in status
+        or 'UNAVAILABLE' in status
+        or 'HIGH DEMAND' in message
+    )
 
 
 def select_adapter(backend: str) -> BaseAdapter:
@@ -1233,11 +1256,12 @@ async def on_message(message):
     async with message.channel.typing():
         try:
             await send_progress(message, job_id, '生成中', 'AIで回答プランを作成しています。')
-            model_text = adapter.generate(build_prompt(user_query, memory_context))
+            model_text = generate_with_retry(build_prompt(user_query, memory_context), retries=1)
             parsed = parse_model_output(model_text)
             if parsed.mode == 'CHAT' and should_force_retry_reply(user_query, parsed.reply):
-                retry_text = adapter.generate(
-                    build_force_answer_prompt(user_query, parsed.reply, memory_context)
+                retry_text = generate_with_retry(
+                    build_force_answer_prompt(user_query, parsed.reply, memory_context),
+                    retries=1,
                 )
                 retry_parsed = parse_model_output(retry_text)
                 if retry_parsed.reply:
