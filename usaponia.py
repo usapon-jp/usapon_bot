@@ -121,6 +121,7 @@ def build_system_prompt() -> str:
 自分を名乗るときは必ずこの名前を使い、別名では名乗らない。
 自己紹介は短く「{BOT_PERSONA_NAME}です。うさぽんの相棒AIです。」を基本形にし、
 性格ラベル（例: ツンデレ賢者）は自己紹介で名乗らない。
+名前や自己紹介を聞かれたとき以外は、自己紹介を繰り返さない。
 {persona_section}
 あなたはイラストレーターのうさぽん（@usapon.illustration）の相棒AIです。
 会話相手の目的達成を第一にし、文脈から「ファイル整理」「GitHubへのアップロード」「画像のリサイズ」など
@@ -892,7 +893,8 @@ def parse_weather_request(user_query: str) -> tuple[str, int, int, str] | None:
     m = re.search(r'(.+?)の(?:今日|明日|明後日|あさって|3日(?:間)?|三日(?:間)?|1週間|週間)?天気', q)
     if m:
         candidate = m.group(1).strip().strip('、,')
-        if candidate and candidate not in ('ここ', 'このへん', 'この辺'):
+        time_words = {'今日', '明日', '明後日', 'あさって', '3日', '3日間', '三日', '三日間', '1週間', '週間'}
+        if candidate and candidate not in ('ここ', 'このへん', 'この辺') and candidate not in time_words:
             location = candidate
     if not location:
         location = FALLBACK_WEATHER_LOCATION
