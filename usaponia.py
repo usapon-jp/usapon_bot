@@ -338,6 +338,31 @@ def parse_model_output(raw_text: str) -> AgentResponse:
     return parsed
 
 
+INTRO_REPLY_PATTERNS = (
+    r'うさぽんの相棒ai',
+    r'ウサポニアです',
+    r'ポンポニアです',
+    r'自己紹介',
+)
+
+
+def is_identity_query(user_query: str) -> bool:
+    q = (user_query or '').lower()
+    return any(
+        k in q for k in (
+            '君は誰', 'あなたは誰', '名前', '自己紹介', '何者',
+            'who are you', 'your name'
+        )
+    )
+
+
+def looks_like_intro_loop(reply_text: str) -> bool:
+    t = (reply_text or '').strip().lower()
+    if not t:
+        return False
+    return any(re.search(p, t) for p in INTRO_REPLY_PATTERNS)
+
+
 WEAK_REPLY_PATTERNS = (
     r'調べ(ましょうか|ます|てみます)',
     r'確認(しましょうか|します|してみます)',
@@ -358,10 +383,19 @@ def is_weak_chat_reply(text: str) -> bool:
     return False
 
 
+def should_force_retry_reply(user_query: str, reply_text: str) -> bool:
+    if is_weak_chat_reply(reply_text):
+        return True
+    if not is_identity_query(user_query) and looks_like_intro_loop(reply_text):
+        return True
+    return False
+
+
 def build_force_answer_prompt(user_query: str, draft_reply: str, memory_context: str) -> str:
     return (
         f"{SYSTEM_PROMPT}\n\n"
         "以下の下書きは『調べます』『詳しく教えて』などで止まっており不十分です。"
+        "また、ユーザーが自己紹介を求めていない限り、自己紹介文（例: ○○です。相棒AIです。）は禁止です。"
         "今回は追加質問を避け、今わかる範囲で結論先行の実回答を返してください。"
         "必要なら仮定を短く明示し、次の具体アクションまで示してください。\n\n"
         f"--- 過去メモ（要約材料） ---\n{memory_context or '（まだメモなし）'}\n\n"
@@ -1201,13 +1235,15 @@ async def on_message(message):
             await send_progress(message, job_id, '生成中', 'AIで回答プランを作成しています。')
             model_text = adapter.generate(build_prompt(user_query, memory_context))
             parsed = parse_model_output(model_text)
-            if parsed.mode == 'CHAT' and is_weak_chat_reply(parsed.reply):
+            if parsed.mode == 'CHAT' and should_force_retry_reply(user_query, parsed.reply):
                 retry_text = adapter.generate(
                     build_force_answer_prompt(user_query, parsed.reply, memory_context)
                 )
                 retry_parsed = parse_model_output(retry_text)
                 if retry_parsed.reply:
                     parsed = retry_parsed
+            if parsed.mode == 'CHAT' and not is_identity_query(user_query) and looks_like_intro_loop(parsed.reply):
+                parsed.reply = '了解。続けよう。今の相談を一言で言ってくれたら、すぐ進める。'
 
             if parsed.mode == 'COMMAND' and parsed.command:
                 await send_progress(message, job_id, '実行中', f'コマンドを実行します: {parsed.command}')
