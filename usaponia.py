@@ -940,6 +940,55 @@ def weather_code_text(code: int) -> str:
     return WEATHER_CODE_MAP.get(int(code), '不明')
 
 
+def request_json_with_retry(url: str, params: dict, retries: int = 2, timeout: int = 12) -> dict:
+    last_err = None
+    for i in range(retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r.json() or {}
+        except Exception as e:
+            last_err = e
+            if i < retries:
+                time.sleep(0.8 * (i + 1))
+                continue
+            raise
+    if last_err:
+        raise last_err
+    return {}
+
+
+def weather_fallback_with_wttr(location: str, label: str) -> tuple[bool, str]:
+    try:
+        safe_loc = requests.utils.quote(location or FALLBACK_WEATHER_LOCATION)
+        r = requests.get(
+            f'https://wttr.in/{safe_loc}',
+            params={'format': 'j1', 'lang': 'ja'},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json() or {}
+        days = data.get('weather') or []
+        if not days:
+            return True, '天気の取得に失敗した。ネットワークかAPI側の一時エラーかも。少し待って再試行して。'
+
+        idx = 1 if label == '明日' and len(days) > 1 else 0
+        row = days[idx]
+        hi = row.get('maxtempC', '-')
+        lo = row.get('mintempC', '-')
+        desc_list = row.get('hourly') or []
+        desc = '不明'
+        if desc_list:
+            desc_ja = (desc_list[0].get('lang_ja') or [])
+            if desc_ja and isinstance(desc_ja, list):
+                desc = desc_ja[0].get('value', desc)
+            else:
+                desc = desc_list[0].get('weatherDesc', [{'value': '不明'}])[0].get('value', '不明')
+        return True, f'結論。{location}の{label}は「{desc}」。\n最高{hi}℃ / 最低{lo}℃。\n外出前に最新の雨雲だけ見ておいて。'
+    except Exception:
+        return True, '天気の取得に失敗した。ネットワークかAPI側の一時エラーかも。少し待って再試行して。'
+
+
 def parse_weather_request(user_query: str) -> tuple[str, int, int, str] | None:
     q = user_query.strip()
     lq = q.lower()
@@ -1011,18 +1060,16 @@ def fetch_weather_reply(user_query: str) -> tuple[bool, str]:
 
             top = None
             for cand in candidates:
-                geo = requests.get(
+                geo_data = request_json_with_retry(
                     'https://geocoding-api.open-meteo.com/v1/search',
-                    params={
+                    {
                         'name': cand,
                         'count': 1,
                         'language': 'ja',
                         'format': 'json',
                     },
-                    timeout=10,
                 )
-                geo.raise_for_status()
-                results = (geo.json() or {}).get('results') or []
+                results = geo_data.get('results') or []
                 if results:
                     top = results[0]
                     break
@@ -1045,19 +1092,17 @@ def fetch_weather_reply(user_query: str) -> tuple[bool, str]:
                 area_text = ' '.join([x for x in (admin1, admin2, resolved_name) if x]).strip()
 
         need_days = max(days, offset + 1)
-        fc = requests.get(
+        fc_data = request_json_with_retry(
             'https://api.open-meteo.com/v1/forecast',
-            params={
+            {
                 'latitude': lat,
                 'longitude': lon,
                 'daily': 'weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max',
                 'forecast_days': need_days,
                 'timezone': 'Asia/Tokyo',
             },
-            timeout=10,
         )
-        fc.raise_for_status()
-        daily = (fc.json() or {}).get('daily') or {}
+        daily = fc_data.get('daily') or {}
         codes = daily.get('weather_code') or []
         tmax = daily.get('temperature_2m_max') or []
         tmin = daily.get('temperature_2m_min') or []
@@ -1090,8 +1135,9 @@ def fetch_weather_reply(user_query: str) -> tuple[bool, str]:
         lines.append('必要なら時間帯別も出せる。')
         return True, '\n'.join(lines)
 
-    except Exception:
-        return True, '天気の取得に失敗した。ネットワークかAPI側の一時エラーかも。少し待って再試行して。'
+    except Exception as e:
+        print(f'weather error: {e}')
+        return weather_fallback_with_wttr(location, label)
 
 
 async def handle_weather_query(user_query: str) -> tuple[bool, str]:
