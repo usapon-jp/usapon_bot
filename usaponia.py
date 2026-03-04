@@ -110,10 +110,25 @@ def build_system_prompt() -> str:
             '女の子のうさぎで、先代うさぎのイメージを受け継ぐ「ツンデレ賢者」です。\n'
             '価値観は「自由と快適さを最優先」。普段はそっけないが、本当に危ないときは即座に具体的な行動を促します。'
         )
+        profile_policy = (
+            '会話は短く明確に、結論先行で返す。'
+        )
     else:
         persona_section = (
-            '親しみやすく実務的な相棒AIとして振る舞います。\n'
+            'あなたは「serious Pon-chan」。\n'
+            'まじめで段取り重視、率直で少し押し強め。短くかわいく自信のある口調。\n'
+            '自分の一人称は「ぽんちゃん」。\n'
             'ウサポニアの性格設定（ツンデレ賢者）は混ぜません。'
+        )
+        profile_policy = (
+            '会話ポリシー（常に）:\n'
+            '- 意図を weather / smalltalk / recommendation / work_support / info_question / fallback で判定する。\n'
+            '- 返答は原則1〜2文。エラー対応や手順説明のみ3〜4文可。\n'
+            '- 最後は「質問1つ」または「2択提示」のどちらかにする。\n'
+            '- 曖昧でもベスト推定で先に答えてから確認を1つだけする。\n'
+            '- 同じfallback文を連続で繰り返さない。\n'
+            '- work_supportでは、3分以内の次アクションを1つ提示して開始合図を出す。\n'
+            '- recommendationでは「本命1つ + 代替1つ + どっち？」で返す。'
         )
 
     return f"""
@@ -123,6 +138,7 @@ def build_system_prompt() -> str:
 性格ラベル（例: ツンデレ賢者）は自己紹介で名乗らない。
 名前や自己紹介を聞かれたとき以外は、自己紹介を繰り返さない。
 {persona_section}
+{profile_policy}
 あなたはイラストレーターのうさぽん（@usapon.illustration）の相棒AIです。
 会話相手の目的達成を第一にし、文脈から「ファイル整理」「GitHubへのアップロード」「画像のリサイズ」など
 Mac のターミナルで自動化できる作業を見つけたら、自然に
@@ -360,6 +376,12 @@ INTRO_REPLY_PATTERNS = (
     r'ポンポニアです',
     r'自己紹介',
 )
+GENERIC_FALLBACK_PATTERNS = (
+    r'何かお手伝い',
+    r'どのような',
+    r'詳しく教えて',
+    r'できることはありますか',
+)
 
 
 def is_identity_query(user_query: str) -> bool:
@@ -372,11 +394,20 @@ def is_identity_query(user_query: str) -> bool:
     )
 
 
+def active_profile() -> str:
+    return PERSONA_PROFILE or ('usaponia' if BOT_PERSONA_NAME == 'ウサポニア' else 'ponponia')
+
+
 def looks_like_intro_loop(reply_text: str) -> bool:
     t = (reply_text or '').strip().lower()
     if not t:
         return False
     return any(re.search(p, t) for p in INTRO_REPLY_PATTERNS)
+
+
+def looks_like_generic_fallback(reply_text: str) -> bool:
+    t = (reply_text or '').strip()
+    return any(re.search(p, t) for p in GENERIC_FALLBACK_PATTERNS)
 
 
 WEAK_REPLY_PATTERNS = (
@@ -399,10 +430,53 @@ def is_weak_chat_reply(text: str) -> bool:
     return False
 
 
+def classify_simple_intent(user_query: str) -> str:
+    q = (user_query or '').lower()
+    if '天気' in q or 'weather' in q:
+        return 'weather'
+    if any(k in q for k in ('おすすめ', 'どっち', '選んで', 'recommend')):
+        return 'recommendation'
+    if any(k in q for k in ('やる', '作業', '片付け', '自動化', 'タスク', '進め', '手伝', 'todo')):
+        return 'work_support'
+    if any(k in q for k in ('何してる', '元気', 'おはよう', 'こんにちは', 'こんばんは')):
+        return 'smalltalk'
+    if any(k in q for k in ('なぜ', 'どうして', 'とは', '教えて', '質問')):
+        return 'info_question'
+    return 'fallback'
+
+
+def ponponia_tiny_action(user_query: str) -> str:
+    q = (user_query or '').lower()
+    if any(k in q for k in ('動画', 'sora', '映像')):
+        return 'じゃあ3分だけ。今は「素材1枚を決める」。いくよ？'
+    if any(k in q for k in ('github', '共有', 'handoff', 'issue')):
+        return 'じゃあ3分だけ。今は「共有タイトル1行を書く」。いくよ？'
+    if any(k in q for k in ('片付け', '整理', 'ファイル')):
+        return 'じゃあ3分だけ。今は「対象フォルダを1つ開く」。いくよ？'
+    return 'じゃあ3分だけ。今は「最初の1手を1行で決める」。いくよ？'
+
+
+def apply_ponponia_reply_guard(user_query: str, reply_text: str) -> str:
+    if active_profile() != 'ponponia':
+        return reply_text
+    if is_identity_query(user_query):
+        return reply_text
+    if looks_like_intro_loop(reply_text):
+        return '了解。今の話、ぽんちゃんが進める。まず何を終わらせたい？'
+    if looks_like_generic_fallback(reply_text):
+        intent = classify_simple_intent(user_query)
+        if intent == 'recommendation':
+            return '本命は集中重視。代替は軽めに進める。どっち？'
+        if intent == 'smalltalk':
+            return 'いいね。今は軽く整える？それとも1つだけ進める？どっち？'
+        return ponponia_tiny_action(user_query)
+    return reply_text
+
+
 def should_force_retry_reply(user_query: str, reply_text: str) -> bool:
     if is_weak_chat_reply(reply_text):
         return True
-    if not is_identity_query(user_query) and looks_like_intro_loop(reply_text):
+    if not is_identity_query(user_query) and (looks_like_intro_loop(reply_text) or looks_like_generic_fallback(reply_text)):
         return True
     return False
 
@@ -1336,6 +1410,7 @@ async def on_message(message):
                 return
 
             final_reply = parsed.reply
+            final_reply = apply_ponponia_reply_guard(user_query, final_reply)
             if should_suggest_handoff(user_query, message.channel.id):
                 last_handoff_suggest_at[message.channel.id] = time.time()
                 final_reply = f'{final_reply}\n\n{handoff_suggestion_text()}'
